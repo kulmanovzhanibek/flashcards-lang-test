@@ -1,9 +1,51 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
+import 'package:flutter/physics.dart';
 
 import '../models/language_card.dart';
 import '../theme/app_theme.dart';
 import 'card_face.dart';
+
+/// Max tilt applied at the edge of the screen, in radians.
+const double _maxTilt = 0.18;
+
+/// Commit if dragged past this fraction of the card width…
+const double _distanceThreshold = 0.30;
+
+/// …or flicked faster than this (px/s).
+const double _velocityThreshold = 800;
+
+/// Exit speed bounds for the fly-away animation (px/s). A slow drag past the
+/// threshold leaves at the floor speed; a hard flick keeps its own pace up to
+/// the ceiling.
+const double _minExitSpeed = 1600;
+const double _maxExitSpeed = 4000;
+
+/// Snap-back spring: slightly underdamped so the card lands with a subtle
+/// wobble instead of a dead easing curve.
+final SpringDescription _snapBackSpring =
+    SpringDescription.withDampingRatio(mass: 1, stiffness: 500, ratio: 0.8);
+
+/// A committed swipe, reported at the moment the gesture crosses a threshold —
+/// before any exit animation plays. Carries the card's position and release
+/// velocity so the exit animation can continue the motion seamlessly.
+@immutable
+class SwipeCommit {
+  const SwipeCommit({
+    required this.swipedRight,
+    required this.offset,
+    required this.velocity,
+  });
+
+  /// The judged direction: right = "translation is correct".
+  final bool swipedRight;
+
+  /// Card offset relative to its resting position at the moment of commit.
+  final Offset offset;
+
+  /// Horizontal release velocity in px/s (signed, may be near zero when the
+  /// commit came from the distance threshold rather than a flick).
+  final double velocity;
+}
 
 /// A draggable flashcard with hand-rolled swipe physics.
 ///
@@ -12,9 +54,13 @@ import 'card_face.dart';
 ///   * shows a green ("ВЕРНО") or red ("НЕВЕРНО") stamp that fades in with the
 ///     drag distance;
 ///   * on release, commits the swipe only if the drag passed a distance *or*
-///     velocity threshold — otherwise it springs back to centre (snap-back);
-///   * a committed swipe flies the card off-screen, fires haptics matching the
-///     grade, then notifies the parent via [onSwipe].
+///     velocity threshold — otherwise it springs back to centre on a real
+///     [SpringSimulation] seeded with the release velocity, so the hand's
+///     momentum carries into the snap-back.
+///
+/// On commit this widget does *not* animate the exit itself: it reports a
+/// [SwipeCommit] immediately so the parent can grade the answer right away
+/// (instant streak/haptics) and hand the visual exit to [FlyAwayCard].
 ///
 /// I implemented the gesture directly (rather than pulling in a card-swiper
 /// package) because the snap-back-vs-commit decision and the tilt are the heart
@@ -23,13 +69,13 @@ class SwipeableCard extends StatefulWidget {
   const SwipeableCard({
     super.key,
     required this.card,
-    required this.onSwipe,
+    required this.onCommit,
   });
 
   final LanguageCard card;
 
-  /// Called once the committed card has finished flying off-screen.
-  final void Function(bool swipedRight) onSwipe;
+  /// Called the instant the swipe crosses a commit threshold.
+  final ValueChanged<SwipeCommit> onCommit;
 
   @override
   State<SwipeableCard> createState() => _SwipeableCardState();
@@ -37,38 +83,20 @@ class SwipeableCard extends StatefulWidget {
 
 class _SwipeableCardState extends State<SwipeableCard>
     with SingleTickerProviderStateMixin {
-  /// Max tilt applied at the edge of the screen, in radians.
-  static const double _maxTilt = 0.18;
-
-  /// Commit if dragged past this fraction of the card width…
-  static const double _distanceThreshold = 0.30;
-
-  /// …or flicked faster than this (px/s).
-  static const double _velocityThreshold = 800;
-
   late final AnimationController _controller;
-  Animation<Offset> _animation = const AlwaysStoppedAnimation<Offset>(Offset.zero);
+  Animation<Offset> _animation =
+      const AlwaysStoppedAnimation<Offset>(Offset.zero);
 
   Offset _offset = Offset.zero;
   Size _size = Size.zero;
-  bool _locked = false; // blocks input while the card flies out
-  VoidCallback? _onSettled;
+  bool _committed = false; // blocks input once the swipe is handed off
 
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 300),
-    )
-      ..addListener(() => setState(() => _offset = _animation.value))
-      ..addStatusListener((status) {
-        if (status == AnimationStatus.completed) {
-          final callback = _onSettled;
-          _onSettled = null;
-          callback?.call();
-        }
-      });
+    // Unbounded so the spring may overshoot past its target (value > 1.0).
+    _controller = AnimationController.unbounded(vsync: this)
+      ..addListener(() => setState(() => _offset = _animation.value));
   }
 
   @override
@@ -78,59 +106,56 @@ class _SwipeableCardState extends State<SwipeableCard>
   }
 
   void _onPanStart(DragStartDetails _) {
-    if (_locked) return;
-    _controller.stop();
+    if (_committed) return;
+    _controller.stop(); // grabbing mid-snap-back picks the card up in place
   }
 
   void _onPanUpdate(DragUpdateDetails details) {
-    if (_locked) return;
+    if (_committed) return;
     setState(() => _offset += details.delta);
   }
 
   void _onPanEnd(DragEndDetails details) {
-    if (_locked) return;
+    if (_committed) return;
     final width = _size.width == 0 ? 1.0 : _size.width;
     final dx = _offset.dx;
     final vx = details.velocity.pixelsPerSecond.dx;
 
     final passedDistance = dx.abs() > width * _distanceThreshold;
+    // The tiny distance guard filters out twitchy zero-length flicks.
     final passedVelocity = vx.abs() > _velocityThreshold && dx.abs() > 12;
 
     if (passedDistance || passedVelocity) {
       // Direction follows the flick when velocity-triggered, else the drag.
       final swipedRight = (passedVelocity ? vx : dx) > 0;
-      _flyOut(swipedRight);
+      _committed = true;
+      widget.onCommit(SwipeCommit(
+        swipedRight: swipedRight,
+        offset: _offset,
+        velocity: vx,
+      ));
     } else {
-      _settle(Offset.zero); // not enough — snap back to centre
+      _springBack(details.velocity.pixelsPerSecond);
     }
   }
 
-  void _flyOut(bool swipedRight) {
-    // Fire feedback immediately on commit, while the card is still animating,
-    // so it feels responsive. Grade is derivable here from ground truth.
-    final wasCorrect = widget.card.isSwipeCorrect(swipedRight: swipedRight);
-    if (wasCorrect) {
-      HapticFeedback.mediumImpact();
-    } else {
-      HapticFeedback.heavyImpact();
-    }
+  /// Springs the card back to centre, seeding the simulation with the release
+  /// velocity so it first drifts with the hand before returning.
+  void _springBack(Offset releaseVelocity) {
+    _animation = Tween<Offset>(begin: _offset, end: Offset.zero)
+        .animate(_controller);
 
-    _locked = true;
-    final target = Offset(
-      (swipedRight ? 1.5 : -1.5) * _size.width,
-      _offset.dy + _size.height * 0.15,
-    );
-    _onSettled = () => widget.onSwipe(swipedRight);
-    _settle(target, curve: Curves.easeIn);
-  }
+    // The controller runs 0→1 along the offset→centre track; project the
+    // release velocity (px/s) onto that track to get its unit-space speed.
+    final delta = -_offset;
+    final unitVelocity = delta == Offset.zero
+        ? 0.0
+        : (releaseVelocity.dx * delta.dx + releaseVelocity.dy * delta.dy) /
+            delta.distanceSquared;
 
-  void _settle(Offset target, {Curve curve = Curves.easeOut}) {
-    _animation = Tween<Offset>(begin: _offset, end: target).animate(
-      CurvedAnimation(parent: _controller, curve: curve),
-    );
     _controller
-      ..reset()
-      ..forward();
+      ..value = 0
+      ..animateWith(SpringSimulation(_snapBackSpring, 0, 1, unitVelocity));
   }
 
   @override
@@ -139,7 +164,7 @@ class _SwipeableCardState extends State<SwipeableCard>
       builder: (context, constraints) {
         _size = Size(constraints.maxWidth, constraints.maxHeight);
         final width = _size.width == 0 ? 1.0 : _size.width;
-        final tilt = (_offset.dx / width).clamp(-1.0, 1.0) * _maxTilt;
+        final tilt = _tiltFor(_offset, width);
 
         // Overlay intensity tracks progress toward the commit threshold.
         final progress =
@@ -164,6 +189,118 @@ class _SwipeableCardState extends State<SwipeableCard>
                 ],
               ),
             ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Tilt shared by the interactive card and the fly-away copy so the exit
+/// continues the exact pose the drag left off at.
+double _tiltFor(Offset offset, double width) =>
+    (offset.dx / width).clamp(-1.0, 1.0) * _maxTilt;
+
+/// The departing card: rendered above the stack after a commit, it flies the
+/// card off-screen starting from the exact offset the drag released it at.
+///
+/// The exit inherits the flick velocity — a hard flick leaves at its own pace
+/// (capped at [_maxExitSpeed]), a slow drag past the distance threshold leaves
+/// at [_minExitSpeed] — so the animation reads as the same motion continuing,
+/// not a canned 300 ms tween.
+class FlyAwayCard extends StatefulWidget {
+  const FlyAwayCard({
+    super.key,
+    required this.card,
+    required this.commit,
+    required this.onDone,
+  });
+
+  final LanguageCard card;
+  final SwipeCommit commit;
+
+  /// Called once the card has fully left the screen.
+  final VoidCallback onDone;
+
+  @override
+  State<FlyAwayCard> createState() => _FlyAwayCardState();
+}
+
+class _FlyAwayCardState extends State<FlyAwayCard>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late Animation<Offset> _animation;
+  bool _started = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(vsync: this)
+      ..addStatusListener((status) {
+        if (status == AnimationStatus.completed) widget.onDone();
+      });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  /// Sizing arrives via LayoutBuilder, so the flight is configured on the
+  /// first build rather than in initState.
+  void _startOnce(Size size) {
+    if (_started) return;
+    _started = true;
+
+    final commit = widget.commit;
+    final end = Offset(
+      (commit.swipedRight ? 1.5 : -1.5) * size.width,
+      commit.offset.dy + size.height * 0.15,
+    );
+    final distance = (end - commit.offset).distance;
+    final speed = commit.velocity.abs().clamp(_minExitSpeed, _maxExitSpeed);
+
+    _animation = Tween<Offset>(begin: commit.offset, end: end)
+        .animate(_controller);
+    _controller
+      ..duration =
+          Duration(milliseconds: (distance / speed * 1000).round().clamp(80, 500))
+      ..forward();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = Size(constraints.maxWidth, constraints.maxHeight);
+        _startOnce(size);
+        final width = size.width == 0 ? 1.0 : size.width;
+
+        return IgnorePointer(
+          child: AnimatedBuilder(
+            animation: _controller,
+            builder: (context, _) {
+              final offset = _animation.value;
+              return Transform.translate(
+                offset: offset,
+                child: Transform.rotate(
+                  angle: _tiltFor(offset, width),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      CardFace(
+                        word: widget.card.word,
+                        translation: widget.card.translation,
+                      ),
+                      _SwipeStamp(
+                        progress: widget.commit.swipedRight ? 1 : -1,
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
           ),
         );
       },
