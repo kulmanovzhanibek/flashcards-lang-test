@@ -5,8 +5,14 @@ import 'cards_screen.dart';
 import 'progress_screen.dart';
 
 /// Hosts the two screens behind a bottom navigation bar. An [IndexedStack]
-/// keeps both alive so the card stack's position and animations survive a trip
+/// keeps the cards screen alive so the stack's gesture state survives a trip
 /// to the progress tab and back.
+///
+/// The progress screen, however, is remounted on every visit (via a keyed
+/// subtree): inside an IndexedStack its tickers keep running while hidden, so
+/// without the remount the roll-up counters would play once, invisibly, at app
+/// launch and the user would never see them. The screen is stateless — all its
+/// data lives in the controller — so remounting loses nothing.
 class HomeShell extends StatefulWidget {
   const HomeShell({super.key});
 
@@ -16,8 +22,14 @@ class HomeShell extends StatefulWidget {
 
 class _HomeShellState extends State<HomeShell> {
   int _index = 0;
+  int _progressVisits = 0;
 
-  void _goTo(int index) => setState(() => _index = index);
+  void _goTo(int index) {
+    setState(() {
+      if (index == 1 && _index != 1) _progressVisits++;
+      _index = index;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -31,7 +43,10 @@ class _HomeShellState extends State<HomeShell> {
             index: _index,
             children: [
               CardsScreen(onViewProgress: () => _goTo(1)),
-              const ProgressScreen(),
+              KeyedSubtree(
+                key: ValueKey('progress-visit-$_progressVisits'),
+                child: const ProgressScreen(),
+              ),
             ],
           ),
         ),
